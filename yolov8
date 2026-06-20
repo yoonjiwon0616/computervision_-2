@@ -1,0 +1,249 @@
+import os
+import re
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+def parse_script_file(filepath):
+    """
+    [알고리즘 1: 스크립트 파싱 엔진]
+    cv_hw2_mp4script.txt 파일로부터 비디오 파일명과 매칭되는 다각형 ROI 좌표를 추출합니다.
+    """
+    video_configs = []
+    current_video = None
+    current_points = []
+
+    if not os.path.exists(filepath):
+        print(f"[Error] 스크립트 파일이 존재하지 않습니다: {filepath}")
+        return video_configs
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # 정규표현식 대신 확장자 검사를 통해 처리 속도를 높이고 동영상 파일 라인을 식별
+        if line.endswith('.mp4'):
+            if current_video:
+                # 이전 영상 정보가 존재하면 구조화된 딕셔너리 형태로 리스트에 저장
+                video_configs.append({'video': current_video, 'roi': current_points})
+            current_video = line
+            current_points = [] # 새로운 영상을 위한 좌표 리스트 초기화
+            
+        # 정규표현식을 사용하여 <Point>X,Y</Point> 구조에서 숫자(좌표)만 정밀 추출
+        elif line.startswith('<Point>'):
+            match = re.findall(r'\d+', line)
+            if match and len(match) == 2:
+                current_points.append([int(match[0]), int(match[1])])
+                
+    # 마지막으로 읽은 동영상 구성 정보를 파싱 목록에 최종 추가
+    if current_video:
+        video_configs.append({'video': current_video, 'roi': current_points})
+        
+    return video_configs
+
+def is_person_fully_inside(box, roi_polygon):
+    """
+    [알고리즘 2: 기하학적 객체 완전 포함 판정 엔진]
+    YOLO의 2차원 바운딩 박스(Bounding Box)가 다각형 ROI 내부 영역에 100% 진입했는지 검증합니다.
+    """
+    x1, y1, x2, y2 = box
+    
+    # 바운딩 박스의 좌상단, 우상단, 좌하단, 우하단 4개 모든 꼭지점(Corner Points) 정의
+    corners = [
+        (x1, y1), (x2, y1),
+        (x1, y2), (x2, y2)
+    ]
+    
+    # Ray-Casting 기반의 pointPolygonTest 알고리즘 적용
+    # 4개 꼭지점 중 단 하나라도 ROI 다각형 외부에 존재하면(음수 값 반환) 완전히 진입하지 않은 것으로 판정
+    for pt in corners:
+        if cv2.pointPolygonTest(roi_polygon, pt, False) < 0:
+            return False # 영역 경계선 밖으로 신체 일부가 탈출함
+            
+    return True # 모든 꼭지점이 다각형 내부에 존재하므로 완벽한 침입 상태
+
+def process_videos():
+    """
+    [알고리즘 3: 비디오 파이프라인 및 시계열 이벤트 상태 기계]
+    프레임 스트림을 처리하며 프레임 카운트 기반의 정밀 시간 계측 및 상태 전이를 제어합니다.
+    """
+    script_filename = "cv_hw2_mp4script.txt"
+    video_configs = parse_script_file(script_filename)
+    
+    # 출력 요구사항 2에 명시된 서브 폴더 구성 규칙 준수
+    result_dir = "Result"
+    os.makedirs(result_dir, exist_ok=True)
+    
+    # 가벼우면서도 실시간 처리가 가능한 고성능 사전학습 모델 YOLOv8-nano 로드
+    model = YOLO("yolov8n.pt")
+    event_logs = []
+
+    for config in video_configs:
+        video_name = config['video']
+        roi_pts = np.array(config['roi'], dtype=np.int32) # OpenCV 연산을 위해 NumPy 배열화
+        
+        if not os.path.exists(video_name):
+            print(f"[Warning] 파일 누락 건너뜁니다: {video_name}")
+            continue
+            
+        cap = cv2.VideoCapture(video_name)
+        fps = cap.get(cv2.CAP_PROP_FPS) # 동영상의 정확한 FPS(Frame Per Second) 추출
+        if fps == 0 or np.isnan(fps):
+            fps = 30.0 # 메타데이터 손상 시 기본값 예외 처리
+            
+        # 요구 결과 파일 1 규칙 적용: 원본명_box.mp4, 해상도 320x180 리사이즈 규격 명시
+        out_name = os.path.join(result_dir, video_name.replace(".mp4", "_box.mp4"))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out_video = cv2.VideoWriter(out_name, fourcc, fps, (320, 180))
+        
+        # 순차적 시계열 이벤트 기록을 위한 유한 상태 기계(FSM) 제어 변수
+        frame_count = 0
+        is_area_occupied = False   # 현재 ROI 영역 내에 사람이 '완전히' 진입해 있는지 여부
+        inside_start_frame = -1    # 최초 완전 침입이 발생한 시점의 프레임 번호
+        
+        video_events = []
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break # 영상 종료 시 루프 탈출
+                
+            frame_count += 1
+            current_time_sec = frame_count / fps # 프레임 번호를 실시간 초(Second) 단위로 정밀 변환
+            
+            # 성능 향상 기법: 추론 연산 시 불필요한 콘솔 로그 스트림을 차단하여 I/O 오버헤드 방지
+            results = model(frame, verbose=False)[0]
+            boxes = results.boxes.data.cpu().numpy()
+            
+            any_person_fully_inside = False
+            
+            for box in boxes:
+                if int(box[5]) == 0:  # COCO Dataset 클래스 0번 = 'Person' (사람 객체 필터링)
+                    x1, y1, x2, y2 = map(int, box[:4])
+                    
+                    # 시각화 요구사항: 원본 해상도 프레임 위에 바운딩 박스 렌더링
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    # 현재 프레임에서 탐지된 사람 중 단 한 명이라도 ROI 내부에 완전히 포함되는지 검사
+                    if is_person_fully_inside((x1, y1, x2, y2), roi_pts):
+                        any_person_fully_inside = True
+
+            # 리포트 시각화 품질 향상: ROI 다각형 영역을 30% 알파 투명도의 적색 스크린으로 프레임 오버레이
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [roi_pts], (0, 0, 255))
+            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+            cv2.polylines(frame, [roi_pts], True, (0, 0, 255), 2)
+            
+            # --- 상태 기계(State Machine) 기반 시간 추적 로직 ---
+            
+            # 상태 1: 빈 영역이었으나 사람이 완전히 진입한 시점 체킹
+            if not is_area_occupied and any_person_fully_inside:
+                is_area_occupied = True
+                inside_start_frame = frame_count # 진입 타이밍 프레임 기록
+                
+            # 상태 2: 영역 내에 사람이 상주하다가 모든 신체가 완전히 탈출한 시점 체킹 (Alarm OFF)
+            elif is_area_occupied and not any_person_fully_inside:
+                is_area_occupied = False
+                # 진입 조건을 충족하고 1초(fps 프레임 수) 이상 유지된 정당한 이벤트인 경우에만 종료 기록
+                if inside_start_frame != -1 and (frame_count - inside_start_frame) / fps >= 1.0:
+                    minutes = int(current_time_sec // 60)
+                    seconds = int(current_time_sec % 60)
+                    video_events.append(f"Alarm OFF: {minutes:02d}:{seconds:02d}")
+                inside_start_frame = -1 # 기준 타이머 초기화
+                
+            # 상태 3: 침입 후 1초가 경과한 시점의 정밀 검증 및 Alarm ON 출력 (중복 기록 방지)
+            if is_area_occupied and inside_start_frame != -1:
+                # 현재 프레임 누적 수와 진입 시점 프레임 수의 차이가 정확히 1초 분량(int(fps))이 되는 시점
+                if (frame_count - inside_start_frame) == int(fps):
+                    alarm_on_time = (inside_start_frame / fps) + 1.0 # 진입 시점 + 1초 처리 적용
+                    minutes = int(alarm_on_time // 60)
+                    seconds = int(alarm_on_time % 60)
+                    video_events.append(f"Alarm ON : {minutes:02d}:{seconds:02d}")
+
+            # 요구사항 규격 준수: 고해상도 연산 프레임을 출력 저장을 위해 320x180으로 보간법 축소
+            resized_frame = cv2.resize(frame, (320, 180))
+            out_video.write(resized_frame)
+            
+        # 예외 처리: 영상이 끝날 때까지 사람이 퇴장하지 않고 침입 상태를 유지할 경우 강제 이탈 처리
+        if is_area_occupied and inside_start_frame != -1 and (frame_count - inside_start_frame) / fps >= 1.0:
+            end_time_sec = frame_count / fps
+            minutes, seconds = int(end_time_sec // 60), int(end_time_sec % 60)
+            video_events.append(f"Alarm OFF: {minutes:02d}:{seconds:02d}")
+
+        cap.release()
+        out_video.release()
+        
+        # 텍스트 출력 규격 포맷팅 구현
+        event_logs.append(f"[{video_name}]")
+        if video_events:
+            event_logs.extend(video_events)
+        else:
+            event_logs.append("No Events Detected")
+        event_logs.append("")
+
+    # 요구 결과 파일 2 기록 자동화 파일 입출력
+    with open("event_detection_result.txt", "w", encoding="utf-8") as txt_file:
+        for log in event_logs:
+            txt_file.write(log + "\n")
+
+if __name__ == "__main__":
+    process_videos()
+
+---
+[test_beach.mp4]
+
+Alarm ON : 00:36
+Alarm OFF: 00:59
+Alarm ON : 01:00
+Alarm OFF: 01:27
+Alarm ON : 01:28
+Alarm OFF: 01:30
+Alarm ON : 01:31
+Alarm OFF: 01:34
+Alarm ON : 02:02
+Alarm OFF: 02:02
+Alarm ON : 02:24
+Alarm OFF: 02:24
+Alarm ON : 02:25
+Alarm OFF: 02:25
+Alarm ON : 02:39
+Alarm OFF: 03:20
+
+[test_street.mp4]
+Alarm ON : 00:38
+Alarm OFF: 00:43
+
+[test_snowhouse.mp4]
+No Events Detected
+
+[test_ticketbox.mp4]
+Alarm ON : 00:37
+Alarm OFF: 00:37
+
+[test_snownight.mp4]
+Alarm ON : 00:01
+Alarm OFF: 00:01
+Alarm ON : 00:03
+Alarm OFF: 00:24
+Alarm ON : 00:25
+Alarm OFF: 00:29
+Alarm ON : 00:30
+Alarm OFF: 00:33
+Alarm ON : 00:34
+Alarm OFF: 00:38
+Alarm ON : 00:40
+Alarm OFF: 00:40
+Alarm ON : 00:41
+Alarm OFF: 00:54
+Alarm ON : 00:55
+Alarm OFF: 00:57
+Alarm ON : 00:58
+Alarm OFF: 01:05
+Alarm ON : 01:06
+Alarm OFF: 01:07
+Alarm ON : 01:09
+Alarm OFF: 01:16
