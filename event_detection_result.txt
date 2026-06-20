@@ -1,0 +1,25 @@
+[test_beach.mp4]
+Alarm ON : 00:36
+Alarm ON : 00:37
+Alarm OFF: 00:45
+Alarm OFF: 01:22
+
+[test_street.mp4]
+Alarm ON : 00:38
+Alarm OFF: 00:49
+
+[test_snowhouse.mp4]
+No Events Detected
+
+[test_ticketbox.mp4]
+Alarm ON : 00:31
+Alarm OFF: 00:32
+
+[test_snownight.mp4]
+Alarm ON : 00:40
+Alarm OFF: 00:41
+Alarm ON : 00:48
+Alarm OFF: 00:50
+Alarm ON : 01:00
+Alarm OFF: 01:03
+
